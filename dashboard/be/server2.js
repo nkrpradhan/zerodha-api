@@ -360,80 +360,145 @@ async function startOrderPolling() {
  * Initializes and manages the Kite Connect ticker for live price updates.
  * @param {string} accessToken - The access token for Kite Connect.
  */
-function startTicker(access_token) {
-  const ticker = getTicker(access_token);
+function startTicker(accessToken) {
+  if (!isMarketOpenInIST()) {
+    console.warn("⏳ Market is closed (IST). Skipping ticker.");
+    return;
+  }
+  const ticker = getTicker(accessToken);
 
   ticker.connect();
 
   ticker.on("connect", () => {
     console.log("🔗 Ticker connected.");
-    const tokens = Object.values(tokenMap);
-    if (tokens.length > 0) {
-      ticker.subscribe(tokens);
-      ticker.setMode(ticker.modeLTP, tokens);
+    
+
+  // Periodically subscribe to new instrument tokens
+  setInterval(() => {
+    const newTokens = Array.from(instrumentTokenMap.values()).filter(
+      (t) => !subscribedTokens.has(t)
+    );
+    if (newTokens.length > 0) {
+      ticker.subscribe(newTokens);
+      ticker.setMode(ticker.modeLTP, newTokens);
+      newTokens.forEach((t) => subscribedTokens.add(t));
+      console.log("📡 Subscribed to new tokens:", newTokens);
     }
-  });
+  }, TICKER_SUBSCRIPTION_INTERVAL);
 
   ticker.on("ticks", async (ticks) => {
-    console.log(
-      "📈 Ticks received:",
-      ticks.map((t) => t.instrument_token)
-    );
+    console.log('ticks start check lossTriggered::',lossTriggered);
+    if (lossTriggered) return;
+
+    // --- PnL Monitoring ---
+    try {
+      console.log('=======ticks pnl monitoring start======');
+      const positions = await kc.getPositions();
+      const net = positions.net || [];
+      const totalPnl = net.reduce((sum, p) => sum + p.pnl, 0);
+      console.log(`📉 Live PnL: ₹${totalPnl.toFixed(2)}`);
+
+      if (totalPnl < 0 && Math.abs(totalPnl) >= Math.abs(MAX_DAILY_LOSS)) {
+        console.warn(
+          `⛔ Max daily loss breached on ticks! (PnL: ₹${totalPnl.toFixed(
+            2
+          )}). Initiating square off.`
+        );
+        lossTriggered = true;
+        await squareOffAllPositions();
+        setTimeout(async () => {
+          try {
+            await kc.logout();
+            await fs.writeFile(HALT_PATH, "halted", "utf-8");
+            console.log(
+              "🔒 Session logged out. Trading halted for the day. Restart application to trade again."
+            );
+            process.exit(0); // Exit the process after halting
+          } catch (logoutErr) {
+            console.error(
+              "❌ Error logging out or halting:",
+              logoutErr.message
+            );
+          }
+        }, SESSION_LOGOUT_DELAY);
+      }
+    } catch (err) {
+      console.error("Tick-based PnL error:", err.message);
+    }
+
+    // --- Trailing Stop-Loss Logic ---
     for (const tick of ticks) {
+      console.log("inside trailing sl logic::", tick);
       const token = tick.instrument_token;
-      const symbol = Object.keys(tokenMap).find(
-        (key) => tokenMap[key] === token
+      const symbol = Array.from(instrumentTokenMap.keys()).find(
+        (key) => instrumentTokenMap.get(key) === token
       );
       if (!symbol) continue;
 
+      // Iterate through all active trailing orders for this symbol
       for (const [key, trail] of activeTrailOrders.entries()) {
-        if (!key.startsWith(symbol + "_")) continue;
+        console.log("inside activeTrailOrders loop::", key, trail);
+        if (!key.startsWith(symbol)) continue; // Only process relevant trails
 
         const {
           entryPrice,
           slOrderId,
           isBuy,
           trailingActive,
-          bestPrice,
-          lastTrailTrigger,
           initialRisk,
           trailStepCount,
+          qty,
         } = trail;
 
-        const price = tick.last_price;
+        const currentPrice = tick.last_price;
 
-        const trailStart = isBuy
-          ? entryPrice + TRAIL_START_MULTIPLIER * initialRisk
-          : entryPrice - TRAIL_START_MULTIPLIER * initialRisk;
-
-        if (!trailingActive) {
-          const hit = isBuy ? price >= trailStart : price <= trailStart;
-          if (hit) {
-            trail.trailingActive = true;
-            console.log(`🚀 Trailing started for ${symbol} at ₹${price}`);
-          } else continue;
+        // Update best price if current price is more favorable
+        if (isBuy && currentPrice > trail.bestPrice) {
+          trail.bestPrice = currentPrice;
+        } else if (!isBuy && currentPrice < trail.bestPrice) {
+          trail.bestPrice = currentPrice;
         }
 
-        const currentSL = isBuy
+        // Check if trailing should be activated
+        if (!trailingActive) {
+          const trailStartPrice = isBuy
+            ? entryPrice + TRAIL_START_MULTIPLIER * initialRisk
+            : entryPrice - TRAIL_START_MULTIPLIER * initialRisk;
+
+          const activateTrailing = isBuy
+            ? currentPrice >= trailStartPrice
+            : currentPrice <= trailStartPrice;
+
+          if (activateTrailing) {
+            trail.trailingActive = true;
+            console.log(
+              `🚀 ${TRAIL_START_MULTIPLIER}R profit reached for ${symbol} (Qty: ${qty}) at ₹${currentPrice}. Trailing activated.`
+            );
+          } else {
+            continue; // Don't trail if not activated yet
+          }
+        }
+
+        // Calculate current SL and next trail trigger
+        const currentSLTrigger = isBuy
           ? entryPrice - TRAIL_BUFFER + (trailStepCount - 1) * initialRisk
           : entryPrice + TRAIL_BUFFER - (trailStepCount - 1) * initialRisk;
 
-        const nextTrailTrigger = isBuy
-          ? currentSL + TRAIL_BUFFER + initialRisk
-          : currentSL - TRAIL_BUFFER - initialRisk;
+        const nextTrailPriceTarget = isBuy
+          ? currentSLTrigger + initialRisk
+          : currentSLTrigger - initialRisk;
 
         const shouldTrail = isBuy
-          ? price >= nextTrailTrigger
-          : price <= nextTrailTrigger;
+          ? currentPrice >= nextTrailPriceTarget
+          : currentPrice <= nextTrailPriceTarget;
 
         if (shouldTrail) {
           trail.trailStepCount += 1;
-          trail.lastTrailTrigger = price;
+          trail.lastTrailTrigger = currentPrice; // Record the price at which it trailed
 
           const newTrigger = isBuy
             ? entryPrice - TRAIL_BUFFER + trail.trailStepCount * initialRisk
             : entryPrice + TRAIL_BUFFER - trail.trailStepCount * initialRisk;
-
           const newLimit = isBuy
             ? newTrigger - SL_BUFFER
             : newTrigger + SL_BUFFER;
@@ -442,19 +507,35 @@ function startTicker(access_token) {
             await kc.modifyOrder("regular", slOrderId, {
               trigger_price: newTrigger,
               price: newLimit,
+              quantity: qty, // Ensure quantity is passed
             });
             console.log(
-              `🔁 SL updated for ${symbol}: Trigger ₹${newTrigger}, Limit ₹${newLimit}`
+              `🔁 SL Updated for ${symbol} (Qty: ${qty}): Trigger ₹${newTrigger.toFixed(
+                2
+              )}, Limit ₹${newLimit.toFixed(2)}`
             );
           } catch (err) {
-            console.error(`❌ Failed to trail SL for ${symbol}:`, err.message);
+            // Check if the order is already executed/cancelled before trying to modify
+            if (err.message.includes("not in state to be modified")) {
+              console.log(
+                `ℹ️ SL order for ${symbol} (ID: ${slOrderId}) already executed or cancelled. Removing from active trails.`
+              );
+              activeTrailOrders.delete(key);
+            } else {
+              console.error(
+                `❌ SL Update Failed for ${symbol} (ID: ${slOrderId}):`,
+                err.message
+              );
+            }
           }
         }
       }
     }
   });
 
-  ticker.on("error", (err) => console.error("📡 Ticker error:", err.message));
+  ticker.on("error", console.error);
+  ticker.on("close", () => console.log("Ticker disconnected."));
+  ticker.on("reconnect", () => console.log("Ticker reconnected."));
 }
 
 // --- Express App Setup ---
