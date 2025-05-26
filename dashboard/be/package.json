@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "express": "^4.19.2",
+    "kiteconnect": "^4.1.0",
+    "open": "^10.1.2",
+    "socket.io": "^4.7.2"
+  },
+  "type": "commonjs"
+}
