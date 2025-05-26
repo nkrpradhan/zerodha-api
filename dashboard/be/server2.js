@@ -18,8 +18,8 @@ const SL_BUFFER = 2; // Difference between SL trigger and SL limit
 const MAX_DAILY_LOSS = -5000; // Maximum daily loss threshold
 const SESSION_LOGOUT_DELAY = 60 * 1000; // 1 minute delay before logout
 
-const MARKET_OPEN_TIME_MINUTES = 9 * 60; // 09:00 IST in minutes from midnight
-const MARKET_CLOSE_TIME_MINUTES = 15 * 60 + 15; // 15:15 IST in minutes from midnight
+const MARKET_OPEN_TIME_MINUTES = 9 * 60 + 15; // 09:00 IST in minutes from midnight
+const MARKET_CLOSE_TIME_MINUTES = 15 * 60 + 30; // 15:15 IST in minutes from midnight
 
 const ORDER_POLLING_INTERVAL = 10 * 1000; // Poll orders every 10 seconds
 const TICKER_SUBSCRIPTION_INTERVAL = 2 * 1000; // Check for new tokens every 2 seconds
@@ -79,7 +79,10 @@ function isMarketOpenInIST() {
   const totalMinutes = hour * 60 + minute;
 
   console.log(`🕒 IST Time = ${hour}:${minute} (${totalMinutes} min)`);
-  return totalMinutes >= 555 && totalMinutes <= 930; // 9:15 to 15:30 IST
+  return (
+    totalMinutes >= MARKET_OPEN_TIME_MINUTES &&
+    totalMinutes <= MARKET_CLOSE_TIME_MINUTES
+  ); // 9:15 to 15:30 IST
 }
 
 /**
@@ -343,7 +346,7 @@ async function startOrderPolling() {
           }
 
           // If no existing SL covers this specific leg, place a new one
-          await placeStopLossForLeg(leg, pos);
+          placeStopLossForLeg(leg, pos);
           // Ensure instrument token is mapped for ticker subscription
           if (!instrumentTokenMap.has(symbol)) {
             await fetchInstrumentToken(symbol);
@@ -371,28 +374,27 @@ function startTicker(accessToken) {
 
   ticker.on("connect", () => {
     console.log("🔗 Ticker connected.");
-    
 
-  // Periodically subscribe to new instrument tokens
-  setInterval(() => {
-    const newTokens = Array.from(instrumentTokenMap.values()).filter(
-      (t) => !subscribedTokens.has(t)
-    );
-    if (newTokens.length > 0) {
-      ticker.subscribe(newTokens);
-      ticker.setMode(ticker.modeLTP, newTokens);
-      newTokens.forEach((t) => subscribedTokens.add(t));
-      console.log("📡 Subscribed to new tokens:", newTokens);
-    }
-  }, TICKER_SUBSCRIPTION_INTERVAL);
-
+    // Periodically subscribe to new instrument tokens
+    setInterval(() => {
+      const newTokens = Array.from(instrumentTokenMap.values()).filter(
+        (t) => !subscribedTokens.has(t)
+      );
+      if (newTokens.length > 0) {
+        ticker.subscribe(newTokens);
+        ticker.setMode(ticker.modeLTP, newTokens);
+        newTokens.forEach((t) => subscribedTokens.add(t));
+        console.log("📡 Subscribed to new tokens:", newTokens);
+      }
+    }, TICKER_SUBSCRIPTION_INTERVAL);
+  });
   ticker.on("ticks", async (ticks) => {
-    console.log('ticks start check lossTriggered::',lossTriggered);
+    console.log("ticks start check lossTriggered::", lossTriggered);
     if (lossTriggered) return;
 
     // --- PnL Monitoring ---
     try {
-      console.log('=======ticks pnl monitoring start======');
+      console.log("=======ticks pnl monitoring start======");
       const positions = await kc.getPositions();
       const net = positions.net || [];
       const totalPnl = net.reduce((sum, p) => sum + p.pnl, 0);
@@ -497,7 +499,10 @@ function startTicker(accessToken) {
           trail.lastTrailTrigger = currentPrice; // Record the price at which it trailed
 
           const newTrigger = isBuy
-            ? entryPrice - TRAIL_BUFFER + trail.trailStepCount * initialRisk
+            ? entryPrice -
+              TRAIL_BUFFER +
+              trail.trailStepCount * initialRisk +
+              trail.trailStepCount * initialRisk
             : entryPrice + TRAIL_BUFFER - trail.trailStepCount * initialRisk;
           const newLimit = isBuy
             ? newTrigger - SL_BUFFER
@@ -533,7 +538,7 @@ function startTicker(accessToken) {
     }
   });
 
-  ticker.on("error", console.error);
+  ticker.on("error", (err) => console.error("📡 Ticker error:", err.message));
   ticker.on("close", () => console.log("Ticker disconnected."));
   ticker.on("reconnect", () => console.log("Ticker reconnected."));
 }
